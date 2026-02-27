@@ -40,9 +40,13 @@ from aumos_observability.api.schemas import (
 )
 
 if TYPE_CHECKING:
+    from aumos_observability.adapters.adaptive_sampling import AdaptiveSamplingEngine
+    from aumos_observability.adapters.cost_tracking import ObservabilityCostTracker
     from aumos_observability.adapters.grafana_client import GrafanaClient
     from aumos_observability.adapters.prometheus_client import PrometheusClient
     from aumos_observability.adapters.repositories import AlertRuleRepository, SLORepository
+    from aumos_observability.adapters.slo_engine import SLOEngineAdapter, SLOStatusSnapshot
+    from aumos_observability.adapters.trace_sampling import TraceSamplingAdapter
     from aumos_observability.core.slo_engine import BurnRateResult
 
 logger = get_logger(__name__)
@@ -645,3 +649,263 @@ class MetricsService:
             query=request.query,
             execution_time_ms=execution_ms,
         )
+
+
+# ─────────────────────────────────────────────
+# SLO Engine Service
+# ─────────────────────────────────────────────
+
+
+class SLOEngineService:
+    """Service wrapping the SLOEngineAdapter for dashboard and batch evaluation.
+
+    Provides SLO status snapshots and batch evaluation via the adapter,
+    with repository persistence of results for historical trending.
+
+    Args:
+        slo_engine: SLOEngineAdapter instance.
+        repository: SLO definition repository for fetching definitions.
+    """
+
+    def __init__(
+        self,
+        slo_engine: SLOEngineAdapter,
+        repository: SLORepository,
+    ) -> None:
+        """Initialize SLOEngineService.
+
+        Args:
+            slo_engine: SLOEngineAdapter for SLI and burn rate computation.
+            repository: SLO definition repository.
+        """
+        self._engine = slo_engine
+        self._repo = repository
+
+    async def get_slo_status(
+        self,
+        slo_id: uuid.UUID,
+        tenant: TenantContext,
+    ) -> SLOStatusSnapshot | None:
+        """Retrieve a live SLO status snapshot for a single SLO.
+
+        Args:
+            slo_id: SLO definition primary key.
+            tenant: Current tenant context.
+
+        Returns:
+            SLOStatusSnapshot or None if the SLO is not found.
+        """
+        model = await self._repo.get_by_id(slo_id)
+        if model is None or model.tenant_id != tenant.tenant_id:
+            return None
+
+        return await self._engine.get_slo_status(
+            slo_id=str(model.id),
+            service_name=model.service_name,
+            numerator_query=model.numerator_query,
+            denominator_query=model.denominator_query,
+            target_percentage=model.target_percentage,
+            window_days=model.window_days,
+            fast_burn_threshold=model.fast_burn_threshold,
+            slow_burn_threshold=model.slow_burn_threshold,
+        )
+
+    async def evaluate_all_active_slos(
+        self,
+        tenant: TenantContext,
+    ) -> list[SLOStatusSnapshot]:
+        """Evaluate all active SLOs for a tenant in one batch call.
+
+        Args:
+            tenant: Current tenant context.
+
+        Returns:
+            List of SLOStatusSnapshot for all active SLOs.
+        """
+        items, _total = await self._repo.list_all(
+            page=1,
+            page_size=1000,
+            service_name=None,
+        )
+        definitions = [
+            {
+                "slo_id": str(item.id),
+                "service_name": item.service_name,
+                "numerator_query": item.numerator_query,
+                "denominator_query": item.denominator_query,
+                "target_percentage": item.target_percentage,
+                "window_days": item.window_days,
+                "fast_burn_threshold": item.fast_burn_threshold,
+                "slow_burn_threshold": item.slow_burn_threshold,
+            }
+            for item in items
+            if item.is_active and item.tenant_id == tenant.tenant_id
+        ]
+        return await self._engine.get_batch_slo_statuses(definitions)
+
+
+# ─────────────────────────────────────────────
+# Observability Cost Service
+# ─────────────────────────────────────────────
+
+
+class ObservabilityCostService:
+    """Service exposing observability cost tracking and reporting.
+
+    Wraps ObservabilityCostTracker with tenant context enforcement
+    and budget alerting via Kafka events.
+
+    Args:
+        cost_tracker: ObservabilityCostTracker adapter.
+        publisher: Kafka event publisher for budget alerts.
+    """
+
+    def __init__(
+        self,
+        cost_tracker: ObservabilityCostTracker,
+        publisher: EventPublisher | None = None,
+    ) -> None:
+        """Initialize ObservabilityCostService.
+
+        Args:
+            cost_tracker: ObservabilityCostTracker adapter.
+            publisher: Kafka event publisher.
+        """
+        self._tracker = cost_tracker
+        self._publisher = publisher
+
+    async def get_tenant_cost(
+        self,
+        tenant: TenantContext,
+        budget_limit_usd: float | None = None,
+    ) -> Any:
+        """Get the current observability cost summary for the tenant.
+
+        Args:
+            tenant: Current tenant context.
+            budget_limit_usd: Optional monthly budget limit in USD.
+
+        Returns:
+            TenantCostSummary with component breakdown.
+        """
+        summary = await self._tracker.compute_tenant_cost(
+            tenant_id=str(tenant.tenant_id),
+            budget_limit_usd=budget_limit_usd,
+        )
+        if budget_limit_usd and summary.total_cost_usd > budget_limit_usd and self._publisher:
+            await self._publisher.publish(
+                Topics.OBSERVABILITY_EVENTS,
+                {
+                    "event_type": "observability_budget_exceeded",
+                    "tenant_id": str(tenant.tenant_id),
+                    "total_cost_usd": summary.total_cost_usd,
+                    "budget_limit_usd": budget_limit_usd,
+                },
+            )
+        return summary
+
+    async def generate_report(
+        self,
+        tenant: TenantContext,
+        report_period_days: int = 30,
+        budget_limit_usd: float | None = None,
+    ) -> Any:
+        """Generate a full observability cost report for the tenant.
+
+        Args:
+            tenant: Current tenant context.
+            report_period_days: Days to include in the report period.
+            budget_limit_usd: Monthly budget limit for alerting.
+
+        Returns:
+            CostReport with summary, trends, and recommendations.
+        """
+        return await self._tracker.generate_cost_report(
+            tenant_id=str(tenant.tenant_id),
+            report_period_days=report_period_days,
+            budget_limit_usd=budget_limit_usd,
+        )
+
+
+# ─────────────────────────────────────────────
+# Trace Sampling Service
+# ─────────────────────────────────────────────
+
+
+class TraceSamplingService:
+    """Service wrapping TraceSamplingAdapter and AdaptiveSamplingEngine.
+
+    Provides a unified entry point for sampling decisions with adaptive
+    rate management and per-service configuration.
+
+    Args:
+        sampling_adapter: TraceSamplingAdapter for deterministic decisions.
+        adaptive_engine: AdaptiveSamplingEngine for rate management.
+    """
+
+    def __init__(
+        self,
+        sampling_adapter: TraceSamplingAdapter,
+        adaptive_engine: AdaptiveSamplingEngine,
+    ) -> None:
+        """Initialize TraceSamplingService.
+
+        Args:
+            sampling_adapter: TraceSamplingAdapter for sampling decisions.
+            adaptive_engine: AdaptiveSamplingEngine for rate adjustment.
+        """
+        self._sampler = sampling_adapter
+        self._engine = adaptive_engine
+
+    async def should_sample(
+        self,
+        service_name: str,
+        operation_name: str,
+        has_error: bool = False,
+        duration_ms: float = 0.0,
+        trace_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """Make a sampling decision using adaptive rates and priority rules.
+
+        Delegates to the adaptive engine which applies current rates
+        with priority preservation for errors and slow traces.
+
+        Args:
+            service_name: Service name for the trace.
+            operation_name: Operation or endpoint name.
+            has_error: True if the trace contains errors.
+            duration_ms: Trace duration for latency-based sampling.
+            trace_id: Optional trace ID for deterministic hashing.
+
+        Returns:
+            Tuple of (should_sample, reason).
+        """
+        return self._engine.should_sample(
+            service_name=service_name,
+            operation_name=operation_name,
+            has_error=has_error,
+            duration_ms=duration_ms,
+            trace_id=trace_id,
+        )
+
+    async def run_rate_adjustment(self, service_names: list[str]) -> list[Any]:
+        """Run one adaptive rate adjustment cycle for a set of services.
+
+        Args:
+            service_names: Services to evaluate.
+
+        Returns:
+            List of AdaptiveAdjustment records for services whose rates changed.
+        """
+        return await self._engine.run_adjustment_cycle(service_names)
+
+    async def get_sampling_metrics(self, service_name: str) -> Any:
+        """Get effectiveness metrics for the adaptive engine.
+
+        Args:
+            service_name: Service to report on.
+
+        Returns:
+            SamplingEffectivenessMetrics.
+        """
+        return await self._engine.get_effectiveness_metrics(service_name)
