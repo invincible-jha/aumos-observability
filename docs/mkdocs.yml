@@ -1,0 +1,40 @@
+site_name: AumOS Observability Stack
+site_description: Prometheus, Grafana, Loki, Jaeger, Langfuse, SLO management
+site_url: https://docs.aumos.ai/observability/
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep-purple
+      accent: deep-purple
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Architecture: architecture.md
+  - Guides:
+    - Your First SLO: guides/first-slo.md
+    - Dashboard Guide: guides/dashboards.md
+    - LLM Tracing (Langfuse): guides/llm-tracing.md
+    - Alert Receivers: guides/alert-receivers.md
+    - Anomaly Detection: guides/anomaly-detection.md
+    - Trace-to-Log Correlation: guides/trace-log-correlation.md
+    - RUM (Frontend Monitoring): guides/rum.md
+    - SLO Compliance Reports: guides/slo-reports.md
+    - Grafana Git Sync: guides/grafana-git-sync.md
+  - Alert Rules Reference: alert-rules-reference.md
+  - API Reference: api-reference.md
+  - Troubleshooting: troubleshooting.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - tables

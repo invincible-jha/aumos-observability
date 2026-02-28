@@ -8,6 +8,7 @@ from aumos_common.observability import get_logger
 from aumos_observability.api.alert_routes import router as alert_router
 from aumos_observability.api.dashboard_routes import router as dashboard_router
 from aumos_observability.api.routes.alerting import router as correlation_router
+from aumos_observability.api.routes.anomaly_routes import router as anomaly_router
 from aumos_observability.api.schemas import MetricsQueryRequest, MetricsQueryResponse
 from aumos_observability.api.slo_routes import router as slo_router
 from aumos_observability.core.services import MetricsService
@@ -21,6 +22,7 @@ router.include_router(slo_router)
 router.include_router(alert_router)
 router.include_router(dashboard_router)
 router.include_router(correlation_router)
+router.include_router(anomaly_router)
 
 
 # ─────────────────────────────────────────────
